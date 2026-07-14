@@ -70,22 +70,23 @@ def save_transcript(transcription: str, output_file_name: str) -> None:
     print(f"Successfully saved the transcript on: {output_path}")
 
 # trims audio if instructed
-def prepare_audio(audio_src: str, duration: float) -> str:
+def prepare_audio(audio_src: str, duration: float = None) -> str:
     audio_data, sampling_rate = soundfile.read(audio_src)
 
     if len(audio_data.shape) > 1:
         audio_data = audio_data.mean(axis = 1)
 
-    target_index = int(duration * sampling_rate)
-    target_index = min(target_index, len(audio_data))
+    if duration is not None:
+        target_index = int(duration * sampling_rate)
+        target_index = min(target_index, len(audio_data))
+        audio_data = audio_data[:target_index]
 
-    trimmed_audio = audio_data[:target_index]
-    trimmed_audio_path = audio_src.replace(".wav", "_trimmed.wav")
+    processed_audio = audio_src.replace(".wav", "_processed.wav")
 
-    soundfile.write(trimmed_audio_path, trimmed_audio, sampling_rate)
+    soundfile.write(processed_audio, audio_data, sampling_rate)
 
     print(f"\n[SUCCESS] audio successfully trimmed to {duration} seconds.\n")
-    return trimmed_audio_path
+    return processed_audio
 
 
 def main():
@@ -111,9 +112,11 @@ def main():
     model_id = "hishab/titu_stt_bn_fastconformer"
     output_file_name = f"{ASR}_transcript.txt"
 
-    if len(sys.argv) <= 3:
+    if len(sys.argv) > 2:
         duration = float(sys.argv[2])
         audio_path = prepare_audio(audio_path, duration)
+    else:
+        audio_path = prepare_audio(audio_path, None)
 
     transcription = transcriber(audio_path, model_id, device)
 
