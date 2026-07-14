@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aurora — Ask anything</title>
+<link rel="stylesheet" href="style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,100..900;1,100..900&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <div class="bg"></div>
+  <div class="aura"><span></span><span></span><span></span></div>
+
+  <div class="stage">
+    <h1>What do we <span>verify</span> today?</h1>
+
+    <div class="composer">
+      <div class="composer-glow"></div>
+      <div class="box">
+        <textarea id="input" placeholder="Which news do we need to verify?" rows="1"></textarea>
+        <div class="row">
+          <div class="tools">
+            <div class="dropdown" id="attachDropdown">
+              <div class="pill" id="attachTrigger">
+                <span class="pill-icon" id="attachIcon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                </span>
+                <span class="pill-label" id="attachLabel">Platform</span>
+                <span class="pill-cancel" id="attachCancel" title="Clear selection">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </span>
+              </div>
+              <div class="dropdown-menu" id="attachMenu">
+                <div class="dropdown-item" data-value="upload">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33 2.78 2.78 0 0 0 1.94 2c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.33 29 29 0 0 0-.46-5.33z"/>
+                    <polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
+                  </svg>
+
+                  <div>
+                    <div class="dropdown-item-title">YouTube</div>
+                    <div class="dropdown-item-sub">Paste a YouTube <b>video</b> Link</div>
+                  </div>
+                </div>
+                <div class="dropdown-item" data-value="photos">
+                  <svg viewBox="3 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
+                  </svg>
+
+                  <div>
+                    <div class="dropdown-item-title">Facebook</div>
+                    <div class="dropdown-item-sub">Paste a Facebook <b>Image/Status/Video</b> Link</div>
+                  </div>
+                </div>
+                <div class="dropdown-item" data-value="drive">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                  <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"/>
+                  <line x1="17.5" y1="6.5" x2="17.51" y2="6.5"/>
+                  </svg>
+
+                  <div>
+                    <div class="dropdown-item-title">Instagram</div>
+                    <div class="dropdown-item-sub">Paste an Instagram <b>Image/Status/Video</b> Link</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+          </div>
+          <button class="send" id="sendBtn" aria-label="Send message">
+            <svg viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="hint" id="hint">This is a static UI demo — hook it up to any model API to make it live.</div>
+
+    <div class="pipeline" id="pipeline">
+      <div class="pipeline-head">
+        <span class="pipeline-eyebrow" id="pipelineEyebrow">Verifying</span>
+        <span class="pipeline-source" id="pipelineSource"></span>
+      </div>
+      <ul class="steps" id="steps"></ul>
+    </div>
+
+    <div class="analytics" id="analytics">
+      <div class="analytics-head">
+        <span class="analytics-title">Ingestion complete</span>
+        <button class="analytics-close" id="analyticsClose" aria-label="Dismiss">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="analytics-grid" id="analyticsGrid"></div>
+    </div>
+  </div>
+
+<script src="action.js" defer></script>
+</body>
+</html>
