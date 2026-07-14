@@ -1,9 +1,8 @@
-# compute_wer_cer.py
-# computes both word error rate and character error rate between reference and hypothesis transcripts.
-
 import re
 import sys
 from jiwer import wer, cer, process_words
+
+import unicodedata
 
 # bangla digit to arabic digit mapping to unify numeral styles before comparing.
 bangla_to_arabic_digits = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
@@ -18,6 +17,9 @@ def normalize_transcript(text_content: str) -> str:
     text_content = bracket_tag_pattern.sub(" ", text_content)
     text_content = text_content.translate(bangla_to_arabic_digits)
     text_content = punctuation_pattern.sub(" ", text_content)
+
+    text_content = unicodedata.normalize("NFC", text_content)
+    text_content = text_content.replace("\u200c", "").replace("\u200d", "")
     text_content = re.sub(r"\s+", " ", text_content).strip()
     return text_content
 
