@@ -18,7 +18,6 @@ def extract_yt_data(url: str) -> None:
     # set the download rules
     download_options = {
         "format": "bestaudio/best",
-        "cookiesfrombrowser": ("chrome", ),
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "wav",
