@@ -64,8 +64,28 @@ import numpy as np
 import pandas as pd
 import requests
 import trafilatura
+from tqdm import tqdm
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+class TqdmLoggingHandler(logging.Handler):
+    """Sends log records through tqdm.write() instead of straight to
+    stderr. A normal handler and an active tqdm bar fight over the same
+    line (tqdm redraws via \\r) - every log.info/warning call would tear
+    the bar in half and leave fragments on screen. tqdm.write() pauses the
+    bar, prints the line cleanly above it, then redraws."""
+
+    def emit(self, record):
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[TqdmLoggingHandler()],
+)
 log = logging.getLogger("hybrid_faiss")
 
 # --------------------------------------------------------------------------
@@ -354,10 +374,10 @@ def run_scrape_stage(max_workers: int = DEFAULT_MAX_WORKERS):
     )
 
     write_lock = threading.Lock()
-    done_count = 0
 
     with open(RAW_CORPUS_FILE, "a", encoding="utf-8") as corpus, \
-            concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool, \
+            tqdm(total=len(todo), desc="Scraping", unit="url") as pbar:
 
         future_to_target = {
             pool.submit(scrape_article, url, source): (url, source)
@@ -366,7 +386,6 @@ def run_scrape_stage(max_workers: int = DEFAULT_MAX_WORKERS):
 
         for future in concurrent.futures.as_completed(future_to_target):
             url, source = future_to_target[future]
-            done_count += 1
             try:
                 status, data = future.result()
             except Exception as e:
@@ -386,8 +405,8 @@ def run_scrape_stage(max_workers: int = DEFAULT_MAX_WORKERS):
                 else:
                     log.info(f"Transient failure on {url}, will retry on next run.")
 
-            if done_count % 25 == 0 or done_count == len(todo):
-                log.info(f"[{done_count}/{len(todo)}] scraped")
+            pbar.update(1)
+            pbar.set_postfix_str(source)
 
     log.info("Scraping stage finished.")
 
@@ -514,6 +533,33 @@ def load_and_chunk_documents(file_path: Path) -> list[dict]:
 # Stage 5: hybrid dense + sparse embedding, checkpointed FAISS index
 # ==========================================================================
 
+def _atomic_pickle_dump(obj, path: Path):
+    """Writes a pickle to `path` atomically: dump to a tmp file in the same
+    directory, flush+fsync it to disk, then os.replace() it onto the real
+    path. os.replace is an atomic rename on POSIX and Windows, so a kill
+    mid-write leaves either the old complete file or the new complete file
+    - never a truncated one that raises EOFError on load."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "wb") as f:
+        pickle.dump(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _atomic_np_save(arr: np.ndarray, path: Path):
+    """Same atomicity guarantee as _atomic_pickle_dump, for .npy files.
+    np.save silently appends '.npy' to a bare filename target, which would
+    mangle a '.tmp' suffix - passing an open file handle instead makes it
+    write exactly the bytes we ask for, to the exact tmp path."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "wb") as f:
+        np.save(f, arr)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
 def generate_hybrid_embeddings_with_checkpoint(
     chunked_data: list,
     model,
@@ -538,59 +584,88 @@ def generate_hybrid_embeddings_with_checkpoint(
     sparse_path = checkpoint_dir / "sparse_weights.pkl"
     state_path = checkpoint_dir / "checkpoint_state.pkl"
 
+    checkpoint_ok = False
     if vectors_path.exists() and metadata_path.exists() and sparse_path.exists() and state_path.exists():
-        log.info("Resuming embedding from existing checkpoint...")
-        dense_vecs_all = list(np.load(vectors_path))
-        with open(metadata_path, "rb") as f:
-            metadata_map = pickle.load(f)
-        with open(sparse_path, "rb") as f:
-            sparse_map = pickle.load(f)
-        with open(state_path, "rb") as f:
-            start_index = pickle.load(f)
-    else:
+        try:
+            log.info("Resuming embedding from existing checkpoint...")
+            dense_vecs_all = list(np.load(vectors_path))
+            with open(metadata_path, "rb") as f:
+                metadata_map = pickle.load(f)
+            with open(sparse_path, "rb") as f:
+                sparse_map = pickle.load(f)
+            with open(state_path, "rb") as f:
+                start_index = pickle.load(f)
+            checkpoint_ok = True
+        except (EOFError, pickle.UnpicklingError, OSError, ValueError) as e:
+            # One of the checkpoint files is truncated/corrupt - almost
+            # always from a kill mid-write under the old non-atomic saves.
+            # Don't silently resume from a partial/inconsistent state and
+            # don't crash either: fall back to a fresh checkpoint. (Writes
+            # are atomic now, so this branch shouldn't trigger for runs
+            # made after this fix - it's here to recover from *older*
+            # checkpoints, like the one that just lost 102k chunks.)
+            log.error(f"Checkpoint at {checkpoint_dir} is corrupted ({e}); starting a fresh checkpoint instead.")
+
+    if not checkpoint_ok:
         log.info("Initialising new embedding checkpoint...")
         dense_vecs_all, metadata_map, sparse_map, start_index = [], {}, {}, 0
 
     total_chunks = len(chunked_data)
 
-    for current_index in range(start_index, total_chunks, batch_size):
-        batch_chunks = chunked_data[current_index: current_index + batch_size]
-        text_batch = [chunk["text"] for chunk in batch_chunks]
+    with tqdm(
+        total=total_chunks, initial=start_index, desc="Embedding", unit="chunk"
+    ) as pbar:
+        for current_index in range(start_index, total_chunks, batch_size):
+            batch_chunks = chunked_data[current_index: current_index + batch_size]
+            text_batch = [chunk["text"] for chunk in batch_chunks]
 
-        encoded = model.encode(
-            text_batch,
-            return_dense=True,
-            return_sparse=True,
-            return_colbert_vecs=False,
-            batch_size=batch_size,
-            # Chunks are capped at 800 chars (chunk_size in load_and_chunk_
-            # documents), so BGE-M3's default 8192-token budget is way more
-            # than needed here and just burns VRAM headroom that could
-            # otherwise go toward a bigger batch_size.
-            max_length=512,
-        )
+            encoded = model.encode(
+                text_batch,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
+                # FlagEmbedding's own encode_single_device() spins up two
+                # internal tqdm bars ("pre tokenize" / "Inference Embeddings")
+                # per call, only skipping them when
+                # len(sentences) < batch_size. We always pass exactly
+                # len(text_batch) sentences, so that condition is never
+                # true and a fresh "1/1" pair of bars prints on every one
+                # of our own batches. Passing an internal batch_size one
+                # larger than the slice flips that check to True and mutes
+                # them - the slice still gets processed in a single
+                # internal pass either way, so nothing about the actual
+                # encoding changes.
+                batch_size=len(text_batch) + 1,
+                # Chunks are capped at 800 chars (chunk_size in load_and_chunk_
+                # documents), so BGE-M3's default 8192-token budget is way more
+                # than needed here and just burns VRAM headroom that could
+                # otherwise go toward a bigger batch_size.
+                max_length=512,
+            )
 
-        dense_vecs = np.array(encoded["dense_vecs"], dtype=np.float32)
-        faiss.normalize_L2(dense_vecs)  # L2 normalise up front for inner-product cosine similarity
-        sparse_weights = encoded["lexical_weights"]
+            dense_vecs = np.array(encoded["dense_vecs"], dtype=np.float32)
+            faiss.normalize_L2(dense_vecs)  # L2 normalise up front for inner-product cosine similarity
+            sparse_weights = encoded["lexical_weights"]
 
-        for offset, chunk in enumerate(batch_chunks):
-            vector_id = current_index + offset
-            dense_vecs_all.append(dense_vecs[offset])
-            metadata_map[vector_id] = chunk
-            sparse_map[vector_id] = sparse_weights[offset]
+            for offset, chunk in enumerate(batch_chunks):
+                vector_id = current_index + offset
+                dense_vecs_all.append(dense_vecs[offset])
+                metadata_map[vector_id] = chunk
+                sparse_map[vector_id] = sparse_weights[offset]
 
-        next_index = current_index + len(batch_chunks)
+            next_index = current_index + len(batch_chunks)
 
-        np.save(vectors_path, np.stack(dense_vecs_all))
-        with open(metadata_path, "wb") as f:
-            pickle.dump(metadata_map, f)
-        with open(sparse_path, "wb") as f:
-            pickle.dump(sparse_map, f)
-        with open(state_path, "wb") as f:
-            pickle.dump(next_index, f)
+            # Order matters for crash-safety: state_path (start_index) is written
+            # LAST. If the process dies partway through this block, on-disk
+            # state_path still points at the previous (fully-flushed) batch, so
+            # a resume just redoes at most one batch - it never resumes past
+            # data that didn't actually get saved.
+            _atomic_np_save(np.stack(dense_vecs_all), vectors_path)
+            _atomic_pickle_dump(metadata_map, metadata_path)
+            _atomic_pickle_dump(sparse_map, sparse_path)
+            _atomic_pickle_dump(next_index, state_path)
 
-        log.info(f"Embedded [{next_index}/{total_chunks}] chunks.")
+            pbar.update(len(batch_chunks))
 
     return np.stack(dense_vecs_all), metadata_map, sparse_map
 
