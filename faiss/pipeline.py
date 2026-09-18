@@ -27,11 +27,12 @@ whole project is self-contained:
             completed_urls.txt
             failed_urls.txt                (permanent failures - won't retry)
         checkpoint_data_hybrid/
-            dense_vectors.npy              (embedding-phase checkpoint)
+            dense_vectors.f32              (preallocated memmap, written per batch slice)
+            sparse_weights.stream          (append-only, one pickle record per vector)
+            checkpoint_state.pkl           (start_index + stream offset + corpus fingerprint)
             factcheck_index.faiss          (IndexHNSWFlat, written once at the end)
-            metadata.pkl
-            sparse_weights.pkl
-            checkpoint_state.pkl
+            metadata.pkl                   (consolidated once embedding finishes)
+            sparse_weights.pkl             (consolidated once embedding finishes)
 
 Run:
     python pipeline.py                     # full pipeline
@@ -44,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import gc
 import gzip
 import hashlib
 import io
@@ -137,6 +139,10 @@ COMMON_SITEMAP_PATHS = [
 BENGALI_RANGE = (0x0980, 0x09FF)
 MIN_BENGALI_RATIO = 0.4
 MIN_BODY_CHARS = 200
+# Characters inspected when deciding an article's language. Well above
+# MIN_BODY_CHARS, so every article that survives the length filter still gets
+# a substantial sample.
+LANG_SAMPLE_CHARS = 2000
 
 RETRY_STATUS_CODES = {403, 408, 425, 429, 500, 502, 503, 504}
 MAX_RETRIES = 3
@@ -147,6 +153,17 @@ BACKOFF_BASE_SECONDS = 2.0
 # site starts returning 429s, drop --workers for that run rather than
 # raising it further — the per-URL backoff above still applies per thread.
 DEFAULT_MAX_WORKERS = 8
+
+# How often the corpus/completed/failed handles are flushed during scraping.
+# Anything buffered when a crash happens is just re-scraped next run, so this
+# trades a few seconds of redone work for not paying an fsync per URL.
+SCRAPE_FLUSH_SECONDS = 2.0
+
+# Chunking parameters live here (rather than inline in load_and_chunk_documents)
+# because the embedding checkpoint fingerprints them: changing either value
+# changes the chunk boundaries, which must invalidate an in-progress resume.
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
 
 scraper = cloudscraper.create_scraper(
     browser={"browser": "chrome", "platform": "windows", "desktop": True}
@@ -290,11 +307,6 @@ def get_processed_urls(filepath: Path) -> set[str]:
         return set(line.strip() for line in f if line.strip())
 
 
-def log_url(filepath: Path, url: str):
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(f"{url}\n")
-
-
 def scrape_article(url: str, source: str) -> tuple[str, dict | None]:
     """Downloads a page and extracts headline, publish date, and main body
     text. Returns (status, data) where status is one of:
@@ -309,14 +321,29 @@ def scrape_article(url: str, source: str) -> tuple[str, dict | None]:
             res = scraper.get(url, timeout=10)
 
             if res.status_code == 200:
-                extracted_text = trafilatura.extract(
-                    res.text, include_comments=False, include_tables=False
+                # One call, one lxml parse. The previous version called
+                # trafilatura.extract() and trafilatura.extract_metadata()
+                # separately, which parsed the same HTML document twice and
+                # roughly doubled the CPU cost of this stage. Asking for
+                # JSON output with metadata gets both out of a single pass.
+                payload = trafilatura.extract(
+                    res.text,
+                    include_comments=False,
+                    include_tables=False,
+                    with_metadata=True,
+                    output_format="json",
                 )
-                metadata = trafilatura.extract_metadata(res.text)
+                if not payload:
+                    return "permanent_fail", None
 
-                title_text = metadata.title.strip() if metadata and metadata.title else ""
-                date_text = metadata.date.strip() if metadata and metadata.date else "Unknown Date"
-                body_text = extracted_text.strip() if extracted_text else ""
+                try:
+                    parsed = json.loads(payload)
+                except (ValueError, TypeError):
+                    return "permanent_fail", None
+
+                title_text = (parsed.get("title") or "").strip()
+                date_text = (parsed.get("date") or "").strip() or "Unknown Date"
+                body_text = (parsed.get("text") or "").strip()
 
                 if not title_text or not body_text:
                     return "permanent_fail", None
@@ -361,10 +388,13 @@ def run_scrape_stage(max_workers: int = DEFAULT_MAX_WORKERS):
     completed_urls = get_processed_urls(COMPLETED_LOG)
     failed_urls = get_processed_urls(FAILED_LOG)
 
+    # .iterrows() builds a fresh Series per row and is pathologically slow
+    # on a 100k+ row catalogue. Zipping the raw numpy columns does the same
+    # job in a fraction of the time.
     todo = [
-        (row["url"], row["source"])
-        for _, row in df_targets.iterrows()
-        if row["url"] not in completed_urls and row["url"] not in failed_urls
+        (url, source)
+        for url, source in zip(df_targets["url"].to_numpy(), df_targets["source"].to_numpy())
+        if url not in completed_urls and url not in failed_urls
     ]
 
     log.info(
@@ -374,10 +404,26 @@ def run_scrape_stage(max_workers: int = DEFAULT_MAX_WORKERS):
     )
 
     write_lock = threading.Lock()
+    last_source = None
+    last_flush = time.monotonic()
 
+    # The log files are opened once for the whole run instead of being
+    # reopened per URL (the old log_url() did open+write+close while holding
+    # the write lock, i.e. two syscalls' worth of latency serialised across
+    # every worker). Flushes are batched on a timer rather than fired per
+    # record; SCRAPE_FLUSH_SECONDS bounds how much is at risk on a crash,
+    # and anything unflushed is simply re-scraped on the next run because
+    # the completed log is what defines "already done".
     with open(RAW_CORPUS_FILE, "a", encoding="utf-8") as corpus, \
+            open(COMPLETED_LOG, "a", encoding="utf-8") as completed_fh, \
+            open(FAILED_LOG, "a", encoding="utf-8") as failed_fh, \
             concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool, \
             tqdm(total=len(todo), desc="Scraping", unit="url") as pbar:
+
+        def _flush_all():
+            corpus.flush()
+            completed_fh.flush()
+            failed_fh.flush()
 
         future_to_target = {
             pool.submit(scrape_article, url, source): (url, source)
@@ -398,15 +444,26 @@ def run_scrape_stage(max_workers: int = DEFAULT_MAX_WORKERS):
             with write_lock:
                 if status == "ok":
                     corpus.write(json.dumps(data, ensure_ascii=False) + "\n")
-                    corpus.flush()
-                    log_url(COMPLETED_LOG, url)
+                    completed_fh.write(f"{url}\n")
                 elif status == "permanent_fail":
-                    log_url(FAILED_LOG, url)
+                    failed_fh.write(f"{url}\n")
                 else:
                     log.info(f"Transient failure on {url}, will retry on next run.")
 
+                now = time.monotonic()
+                if now - last_flush >= SCRAPE_FLUSH_SECONDS:
+                    _flush_all()
+                    last_flush = now
+
             pbar.update(1)
-            pbar.set_postfix_str(source)
+            # Updating the postfix redraws the whole bar, so only do it when
+            # the source actually changes rather than on every single URL.
+            if source != last_source:
+                pbar.set_postfix_str(source)
+                last_source = source
+
+        with write_lock:
+            _flush_all()
 
     log.info("Scraping stage finished.")
 
@@ -416,10 +473,25 @@ def run_scrape_stage(max_workers: int = DEFAULT_MAX_WORKERS):
 # ==========================================================================
 
 def _bengali_ratio(text: str) -> float:
+    """Fraction of alphabetic characters that fall in the Bengali block.
+
+    Only the first LANG_SAMPLE_CHARS characters are inspected. Language is a
+    whole-document property here - an article is Bengali or it isn't - so a
+    couple of thousand characters settle it just as decisively as scanning a
+    20KB body, and this used to be two full Python-level passes over every
+    character of every article in the corpus.
+    """
     if not text:
         return 0.0
-    bengali_chars = sum(1 for ch in text if BENGALI_RANGE[0] <= ord(ch) <= BENGALI_RANGE[1])
-    letters = sum(1 for ch in text if ch.isalpha())
+    sample = text[:LANG_SAMPLE_CHARS]
+    lo, hi = BENGALI_RANGE
+    bengali_chars = 0
+    letters = 0
+    for ch in sample:
+        if ch.isalpha():
+            letters += 1
+            if lo <= ord(ch) <= hi:
+                bengali_chars += 1
     return bengali_chars / letters if letters else 0.0
 
 
@@ -509,8 +581,8 @@ def load_and_chunk_documents(file_path: Path) -> list[dict]:
 
     text_splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", "।", " ", ""],
-        chunk_size=800,
-        chunk_overlap=150,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         length_function=len,
     )
 
@@ -547,17 +619,103 @@ def _atomic_pickle_dump(obj, path: Path):
     os.replace(tmp_path, path)
 
 
-def _atomic_np_save(arr: np.ndarray, path: Path):
-    """Same atomicity guarantee as _atomic_pickle_dump, for .npy files.
-    np.save silently appends '.npy' to a bare filename target, which would
-    mangle a '.tmp' suffix - passing an open file handle instead makes it
-    write exactly the bytes we ask for, to the exact tmp path."""
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "wb") as f:
-        np.save(f, arr)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+
+# Bumped whenever the on-disk checkpoint layout changes in a way that makes
+# older checkpoints unreadable. v1 stored metadata/sparse as whole-dict
+# pickles rewritten on every checkpoint; v2 streams sparse weights and drops
+# the metadata checkpoint entirely (see below). A v1 checkpoint is detected
+# and discarded rather than misread.
+CHECKPOINT_FORMAT_VERSION = 2
+
+
+def _checkpoint_fingerprint(chunked_data: list, embedding_dim: int) -> str:
+    """Identifies the exact chunk set a checkpoint belongs to.
+
+    Resuming is only valid if chunk i means the same thing this run as it did
+    last run, because start_index addresses chunks positionally. If the corpus
+    is re-scraped or re-cleaned, or the chunk parameters change, the chunk
+    sequence shifts and a stale start_index silently pairs vectors with the
+    wrong text - no exception, just a quietly wrong index.
+
+    np.memmap does not catch this on its own: mode="r+" raises when the file
+    is too small for the requested shape, but silently maps a prefix when the
+    file is too large, so a shrunken corpus would resume without complaint.
+
+    Hashing the total count, the geometry, the chunk parameters and a spread
+    of probe chunks costs microseconds and turns that silent corruption into
+    a clean "start over".
+    """
+    h = hashlib.sha256()
+    h.update(
+        f"v{CHECKPOINT_FORMAT_VERSION}|{len(chunked_data)}|{embedding_dim}|"
+        f"{CHUNK_SIZE}|{CHUNK_OVERLAP}".encode("utf-8")
+    )
+
+    n = len(chunked_data)
+    probes = {0, 1, 2, n // 3, n // 2, (2 * n) // 3, n - 3, n - 2, n - 1}
+    for i in sorted(p for p in probes if 0 <= p < n):
+        chunk = chunked_data[i]
+        h.update(f"|{i}|".encode("utf-8"))
+        h.update(chunk.get("url", "").encode("utf-8", "replace"))
+        h.update(b"\x00")
+        h.update(chunk.get("text", "").encode("utf-8", "replace"))
+
+    return h.hexdigest()
+
+
+def _encode_with_oom_backoff(model, text_batch: list[str], max_length: int = 512):
+    """Encodes one batch, halving it and retrying on CUDA OOM.
+
+    A 6GB card is close enough to the edge that an unlucky batch of long
+    chunks can OOM even when the configured batch size normally fits. Without
+    this, that kills the process and the next run just walks back into the
+    same batch. Returns (encoded, n_texts_actually_encoded) so the caller can
+    consume only what was encoded and lower its batch size accordingly.
+
+    The batch_size argument passed down to FlagEmbedding is deliberately one
+    larger than the slice. encode_single_device() spins up two internal tqdm
+    bars ("pre tokenize" / "Inference Embeddings") per call, skipping them
+    only when len(sentences) < batch_size; passing len+1 flips that check to
+    True and mutes them. The slice is processed in a single internal pass
+    either way, so nothing about the actual encoding changes.
+
+    max_length=512 rather than BGE-M3's 8192 default: chunks are capped at
+    CHUNK_SIZE characters, so the larger budget only burns VRAM headroom that
+    could otherwise go toward a bigger batch.
+    """
+    import torch
+
+    texts = text_batch
+    while True:
+        try:
+            encoded = model.encode(
+                texts,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
+                batch_size=len(texts) + 1,
+                max_length=max_length,
+            )
+            return encoded, len(texts)
+        except torch.cuda.OutOfMemoryError:
+            if len(texts) == 1:
+                raise
+            torch.cuda.empty_cache()
+            texts = texts[: max(1, len(texts) // 2)]
+            log.warning(f"CUDA OOM on this batch; retrying with {len(texts)} texts.")
+
+
+def _read_sparse_stream(path: Path, expected: int) -> list[dict]:
+    """Replays the append-only sparse stream back into a list of per-vector
+    lexical weight dicts."""
+    weights: list[dict] = []
+    with open(path, "rb") as f:
+        while len(weights) < expected:
+            try:
+                weights.append(pickle.load(f))
+            except EOFError:
+                break
+    return weights
 
 
 def generate_hybrid_embeddings_with_checkpoint(
@@ -565,6 +723,8 @@ def generate_hybrid_embeddings_with_checkpoint(
     model,
     checkpoint_dir: Path = CHECKPOINT_DIR,
     batch_size: int = 32,
+    checkpoint_every_n_batches: int = 20,
+    checkpoint_every_seconds: float = 30.0,
 ):
     """Generates dense vectors and sparse lexical weights with state
     checkpointing, so a killed/interrupted run can resume cleanly.
@@ -574,100 +734,210 @@ def generate_hybrid_embeddings_with_checkpoint(
     separate from indexing (build_hnsw_index(), a second pass once every
     chunk is embedded) - so an interrupted embedding run never has to
     rebuild a partially-populated index.
-    """
-    import faiss
 
+    Per-batch cost is constant, independent of how far into the run we are.
+    Three separate O(n^2)-over-a-run behaviours were removed to get there:
+
+    - Dense vectors used to be re-stacked and rewritten in full every batch.
+      They now go into a preallocated memmap at the batch's exact slice.
+    - Sparse weights used to be held in a dict and re-pickled in full at every
+      checkpoint, so late checkpoints were serialising hundreds of MB. They
+      are now appended to a stream, one pickle record per vector, and only
+      assembled into a dict once at the end. They are never held in RAM
+      during the loop at all.
+    - Metadata used to be checkpointed the same way. It no longer needs
+      checkpointing in any form: metadata_map[i] is just chunked_data[i],
+      which the fingerprint now guarantees is identical across resumes, so it
+      is rebuilt for free at the end instead of being written 1000 times.
+
+    The memmap flush also moved onto the checkpoint interval. flush() msyncs
+    the whole mapping, and dense data ahead of the last checkpointed
+    start_index is re-embedded on resume regardless, so flushing it more often
+    than the checkpoint bought nothing.
+    """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    vectors_path = checkpoint_dir / "dense_vectors.npy"
+    import faiss
+
+    # BGE-M3's dense output is a fixed 1024-dim vector per input.
+    EMBEDDING_DIM = 1024
+
+    vectors_path = checkpoint_dir / "dense_vectors.f32"
+    sparse_stream_path = checkpoint_dir / "sparse_weights.stream"
+    state_path = checkpoint_dir / "checkpoint_state.pkl"
+    # Final consolidated artefacts, written once when embedding completes.
+    # Format unchanged from before, so anything downstream that loads these
+    # (the retrieval side) needs no changes.
     metadata_path = checkpoint_dir / "metadata.pkl"
     sparse_path = checkpoint_dir / "sparse_weights.pkl"
-    state_path = checkpoint_dir / "checkpoint_state.pkl"
-
-    checkpoint_ok = False
-    if vectors_path.exists() and metadata_path.exists() and sparse_path.exists() and state_path.exists():
-        try:
-            log.info("Resuming embedding from existing checkpoint...")
-            dense_vecs_all = list(np.load(vectors_path))
-            with open(metadata_path, "rb") as f:
-                metadata_map = pickle.load(f)
-            with open(sparse_path, "rb") as f:
-                sparse_map = pickle.load(f)
-            with open(state_path, "rb") as f:
-                start_index = pickle.load(f)
-            checkpoint_ok = True
-        except (EOFError, pickle.UnpicklingError, OSError, ValueError) as e:
-            # One of the checkpoint files is truncated/corrupt - almost
-            # always from a kill mid-write under the old non-atomic saves.
-            # Don't silently resume from a partial/inconsistent state and
-            # don't crash either: fall back to a fresh checkpoint. (Writes
-            # are atomic now, so this branch shouldn't trigger for runs
-            # made after this fix - it's here to recover from *older*
-            # checkpoints, like the one that just lost 102k chunks.)
-            log.error(f"Checkpoint at {checkpoint_dir} is corrupted ({e}); starting a fresh checkpoint instead.")
-
-    if not checkpoint_ok:
-        log.info("Initialising new embedding checkpoint...")
-        dense_vecs_all, metadata_map, sparse_map, start_index = [], {}, {}, 0
 
     total_chunks = len(chunked_data)
+    fingerprint = _checkpoint_fingerprint(chunked_data, EMBEDDING_DIM)
+    expected_bytes = total_chunks * EMBEDDING_DIM * 4
 
-    with tqdm(
-        total=total_chunks, initial=start_index, desc="Embedding", unit="chunk"
-    ) as pbar:
-        for current_index in range(start_index, total_chunks, batch_size):
-            batch_chunks = chunked_data[current_index: current_index + batch_size]
-            text_batch = [chunk["text"] for chunk in batch_chunks]
+    start_index = 0
+    sparse_offset = 0
+    dense_memmap = None
+    resumed = False
 
-            encoded = model.encode(
-                text_batch,
-                return_dense=True,
-                return_sparse=True,
-                return_colbert_vecs=False,
-                # FlagEmbedding's own encode_single_device() spins up two
-                # internal tqdm bars ("pre tokenize" / "Inference Embeddings")
-                # per call, only skipping them when
-                # len(sentences) < batch_size. We always pass exactly
-                # len(text_batch) sentences, so that condition is never
-                # true and a fresh "1/1" pair of bars prints on every one
-                # of our own batches. Passing an internal batch_size one
-                # larger than the slice flips that check to True and mutes
-                # them - the slice still gets processed in a single
-                # internal pass either way, so nothing about the actual
-                # encoding changes.
-                batch_size=len(text_batch) + 1,
-                # Chunks are capped at 800 chars (chunk_size in load_and_chunk_
-                # documents), so BGE-M3's default 8192-token budget is way more
-                # than needed here and just burns VRAM headroom that could
-                # otherwise go toward a bigger batch_size.
-                max_length=512,
+    if vectors_path.exists() and sparse_stream_path.exists() and state_path.exists():
+        try:
+            with open(state_path, "rb") as f:
+                state = pickle.load(f)
+
+            if not isinstance(state, dict):
+                raise ValueError("pre-v2 checkpoint (bare start_index)")
+            if state.get("version") != CHECKPOINT_FORMAT_VERSION:
+                raise ValueError(f"checkpoint format v{state.get('version')} is not readable")
+            if state.get("fingerprint") != fingerprint:
+                raise ValueError("chunk set has changed since this checkpoint was written")
+
+            actual_bytes = vectors_path.stat().st_size
+            if actual_bytes != expected_bytes:
+                raise ValueError(
+                    f"dense vector file is {actual_bytes} bytes, expected {expected_bytes}"
+                )
+
+            start_index = int(state["start_index"])
+            sparse_offset = int(state["sparse_offset"])
+            if not 0 <= start_index <= total_chunks:
+                raise ValueError(f"start_index {start_index} outside 0..{total_chunks}")
+            if sparse_offset > sparse_stream_path.stat().st_size:
+                raise ValueError("sparse stream is shorter than the checkpointed offset")
+
+            # mode="r+": open the existing file in place, writable, without
+            # touching what's already on disk - resuming just continues
+            # writing into the same slices future batches need.
+            dense_memmap = np.memmap(
+                vectors_path, dtype=np.float32, mode="r+", shape=(total_chunks, EMBEDDING_DIM)
             )
+            resumed = True
+            log.info(
+                f"Resuming embedding from checkpoint at chunk {start_index}/{total_chunks}."
+            )
+        except (EOFError, pickle.UnpicklingError, OSError, ValueError, KeyError, TypeError) as e:
+            # Either a genuinely corrupt checkpoint, or - far more likely now
+            # that writes are atomic - a checkpoint that belongs to a
+            # different corpus. Neither is safe to resume from, and neither
+            # should crash the run: start clean.
+            log.error(
+                f"Cannot resume checkpoint at {checkpoint_dir} ({e}); starting a fresh one."
+            )
+            start_index, sparse_offset, dense_memmap, resumed = 0, 0, None, False
 
-            dense_vecs = np.array(encoded["dense_vecs"], dtype=np.float32)
-            faiss.normalize_L2(dense_vecs)  # L2 normalise up front for inner-product cosine similarity
-            sparse_weights = encoded["lexical_weights"]
+    if not resumed:
+        log.info("Initialising new embedding checkpoint...")
+        # mode="w+": create (or overwrite) the file at its full final size
+        # up front, zero-filled. Every batch below writes into its own
+        # slice of this same file - never a full rewrite.
+        dense_memmap = np.memmap(
+            vectors_path, dtype=np.float32, mode="w+", shape=(total_chunks, EMBEDDING_DIM)
+        )
 
-            for offset, chunk in enumerate(batch_chunks):
-                vector_id = current_index + offset
-                dense_vecs_all.append(dense_vecs[offset])
-                metadata_map[vector_id] = chunk
-                sparse_map[vector_id] = sparse_weights[offset]
+    last_checkpoint_time = time.monotonic()
+    batches_since_checkpoint = 0
 
-            next_index = current_index + len(batch_chunks)
+    # "r+b" + seek + truncate on resume: a crash between the last checkpoint
+    # and the kill may have left extra complete records past sparse_offset
+    # (they belong to batches that will now be redone). Dropping them keeps
+    # record N in the stream aligned with vector N in the memmap, which is
+    # the whole basis for reading the stream back positionally.
+    stream_mode = "r+b" if resumed else "wb"
+    with open(sparse_stream_path, stream_mode) as sparse_fh:
+        if resumed:
+            sparse_fh.seek(sparse_offset)
+            sparse_fh.truncate()
 
-            # Order matters for crash-safety: state_path (start_index) is written
-            # LAST. If the process dies partway through this block, on-disk
-            # state_path still points at the previous (fully-flushed) batch, so
-            # a resume just redoes at most one batch - it never resumes past
-            # data that didn't actually get saved.
-            _atomic_np_save(np.stack(dense_vecs_all), vectors_path)
-            _atomic_pickle_dump(metadata_map, metadata_path)
-            _atomic_pickle_dump(sparse_map, sparse_path)
-            _atomic_pickle_dump(next_index, state_path)
+        current_index = start_index
+        with tqdm(total=total_chunks, initial=start_index, desc="Embedding", unit="chunk") as pbar:
+            while current_index < total_chunks:
+                batch_chunks = chunked_data[current_index: current_index + batch_size]
+                text_batch = [chunk["text"] for chunk in batch_chunks]
 
-            pbar.update(len(batch_chunks))
+                encoded, used_batch_size = _encode_with_oom_backoff(model, text_batch)
 
-    return np.stack(dense_vecs_all), metadata_map, sparse_map
+                if used_batch_size < len(text_batch):
+                    # The batch was too big for the card and the helper fell
+                    # back to a smaller slice. Shrink the working batch size
+                    # so the rest of the run stops trying the size that just
+                    # OOM'd, and only consume what was actually encoded.
+                    batch_chunks = batch_chunks[:used_batch_size]
+                    batch_size = used_batch_size
+                    log.warning(f"Reducing embedding batch_size to {batch_size} for the rest of the run.")
+
+                dense_vecs = np.asarray(encoded["dense_vecs"], dtype=np.float32)
+                faiss.normalize_L2(dense_vecs)  # L2 normalise up front for inner-product cosine similarity
+
+                next_index = current_index + len(batch_chunks)
+
+                # Write straight into this batch's slice - cost is always just
+                # this batch, never the whole array so far.
+                dense_memmap[current_index:next_index] = dense_vecs
+
+                # Append-only, one record per vector, in vector order. Never
+                # rewritten, never accumulated in memory.
+                for weights in encoded["lexical_weights"]:
+                    pickle.dump(weights, sparse_fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+                batches_since_checkpoint += 1
+                elapsed_since_checkpoint = time.monotonic() - last_checkpoint_time
+                should_checkpoint = (
+                    batches_since_checkpoint >= checkpoint_every_n_batches
+                    or elapsed_since_checkpoint >= checkpoint_every_seconds
+                    or next_index >= total_chunks  # always checkpoint the final batch
+                )
+
+                if should_checkpoint:
+                    # Order matters for crash-safety: state_path is written
+                    # LAST, and only after the data it describes is durable.
+                    # If the process dies partway through this block, the
+                    # on-disk state still points at the previous checkpoint,
+                    # so a resume redoes at most checkpoint_every_n_batches
+                    # batches / checkpoint_every_seconds worth of work. It
+                    # never resumes past data that wasn't actually saved.
+                    dense_memmap.flush()
+                    sparse_fh.flush()
+                    os.fsync(sparse_fh.fileno())
+                    _atomic_pickle_dump(
+                        {
+                            "version": CHECKPOINT_FORMAT_VERSION,
+                            "start_index": next_index,
+                            "sparse_offset": sparse_fh.tell(),
+                            "fingerprint": fingerprint,
+                        },
+                        state_path,
+                    )
+                    last_checkpoint_time = time.monotonic()
+                    batches_since_checkpoint = 0
+
+                pbar.update(len(batch_chunks))
+                current_index = next_index
+
+    dense_memmap.flush()
+
+    # Metadata is pure function of chunked_data, so it costs one pass here
+    # rather than a rewrite per checkpoint. Values are references into
+    # chunked_data, not copies.
+    metadata_map = {i: chunk for i, chunk in enumerate(chunked_data)}
+
+    sparse_list = _read_sparse_stream(sparse_stream_path, total_chunks)
+    if len(sparse_list) != total_chunks:
+        log.warning(
+            f"Sparse stream holds {len(sparse_list)} records for {total_chunks} chunks; "
+            "the checkpoint may be incomplete."
+        )
+    sparse_map = {i: weights for i, weights in enumerate(sparse_list)}
+    del sparse_list
+
+    _atomic_pickle_dump(metadata_map, metadata_path)
+    _atomic_pickle_dump(sparse_map, sparse_path)
+    log.info(f"Wrote consolidated {metadata_path.name} and {sparse_path.name}.")
+
+    # The memmap is returned as-is rather than copied into RAM. It is already
+    # an ndarray subclass, and build_hnsw_index() reads it in slices, so the
+    # OS pages it in and out instead of us holding an extra ~800MB resident
+    # next to the index being built.
+    return dense_memmap, metadata_map, sparse_map
 
 
 def build_hnsw_index(
@@ -676,6 +946,7 @@ def build_hnsw_index(
     M: int = 32,
     ef_construction: int = 200,
     ef_search: int = 64,
+    add_chunk_size: int = 50_000,
 ):
     """Builds an IndexHNSWFlat over the full vector set.
 
@@ -697,7 +968,17 @@ def build_hnsw_index(
     index.hnsw.efConstruction = ef_construction
 
     t0 = time.time()
-    index.add(dense_vecs)
+    # dense_vecs is typically a memmap. Adding it in slices means FAISS only
+    # ever needs one slice materialised at a time (np.ascontiguousarray on a
+    # memmap slice copies just that slice), so peak RAM here is the index
+    # itself plus ~200MB rather than the index plus the entire vector set.
+    # Slicing also gives the progress bar something to report on what is
+    # otherwise a long silent call.
+    with tqdm(total=n_vectors, desc="Indexing", unit="vec") as pbar:
+        for begin in range(0, n_vectors, add_chunk_size):
+            end = min(begin + add_chunk_size, n_vectors)
+            index.add(np.ascontiguousarray(dense_vecs[begin:end], dtype=np.float32))
+            pbar.update(end - begin)
     log.info(f"Added {index.ntotal} vectors in {round(time.time() - t0, 2)}s")
 
     index.hnsw.efSearch = ef_search
@@ -714,16 +995,22 @@ def _select_device_and_batch_size() -> tuple[str, int]:
     actually use the available VRAM instead of leaving it idle.
 
     Thresholds below are tuned for a 6GB card (e.g. RTX 3050) running
-    BGE-M3 in fp16 with max_length=512: batch_size=64 comfortably fits in
-    ~5GB+ free, with headroom below that. If you hit a CUDA OOM anyway
-    (another process sharing the GPU, a longer max_length, etc.), lower
-    batch_size manually or drop these thresholds a notch.
+    BGE-M3 in fp16. max_length=512 is only a ceiling - transformers pad to
+    the longest sequence in the batch, and CHUNK_SIZE-character Bengali
+    chunks tokenise to roughly 250-350 tokens, so real batches sit well under
+    that ceiling and leave headroom the old batch_size=64 never used.
+
+    An OOM is no longer fatal: _encode_with_oom_backoff() halves the batch
+    and the embedding loop keeps the lower size for the rest of the run. Set
+    BGE_BATCH_SIZE to pin a specific value and skip this heuristic entirely.
     """
     import torch
 
+    override = os.environ.get("BGE_BATCH_SIZE")
+
     if not torch.cuda.is_available():
         log.warning("No CUDA GPU detected - falling back to CPU. This will be much slower.")
-        return "cpu", 8
+        return "cpu", int(override) if override else 8
 
     free_bytes, total_bytes = torch.cuda.mem_get_info()
     free_gb = free_bytes / (1024 ** 3)
@@ -732,10 +1019,13 @@ def _select_device_and_batch_size() -> tuple[str, int]:
         f"({free_gb:.1f} GB free / {total_bytes / (1024 ** 3):.1f} GB total)"
     )
 
-    if free_gb >= 5:
-        batch_size = 64
+    if override:
+        batch_size = int(override)
+        log.info(f"Using BGE_BATCH_SIZE={batch_size} from the environment.")
+    elif free_gb >= 5:
+        batch_size = 96
     elif free_gb >= 3:
-        batch_size = 32
+        batch_size = 48
     else:
         batch_size = 16
 
@@ -762,6 +1052,19 @@ def run_index_stage():
         chunked_data=chunked_data, model=model, batch_size=batch_size
     )
     log.info(f"Embedding completed in {round(time.time() - t0, 2)}s. Total vectors: {len(dense_vecs)}.")
+
+    # Release BGE-M3 before the index build. Nothing below this point touches
+    # the model, and holding ~1GB of weights (plus the CUDA context and
+    # allocator cache) while FAISS builds a graph over the full vector set is
+    # the tightest moment for RAM on a 16GB machine.
+    del model
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
     t0 = time.time()
     index = build_hnsw_index(dense_vecs)
