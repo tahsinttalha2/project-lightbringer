@@ -1,4 +1,4 @@
-backend/'=2024.1.0'
-backend/'=4.50'
+backend/=2024.1.0
+backend/=4.50
 backend/__pacache__
 backend/sample_url.txt
