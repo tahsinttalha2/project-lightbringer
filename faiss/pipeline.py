@@ -111,7 +111,7 @@ CHECKPOINT_DIR = BASE_DIR / "checkpoint_data_hybrid"
 # gathers Bengali-language facts - there is no English or mixed-language
 # path anywhere below.
 SITEMAPS = {
-    "rumorscanner": "https://rumorscanner.com/sitemap_index.xml",
+    "rumorscanner": "https://rumorscanner.com/sitemap.xml",
     "boombd": "https://bangla.boombd.com/sitemap.xml",
     "bdfactcheck": "https://bdfactcheck.com/sitemap.xml",
     "jachai": "https://jachai.org/sitemap.xml",
